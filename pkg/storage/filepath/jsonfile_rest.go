@@ -3,6 +3,7 @@ package filepath
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -30,13 +31,10 @@ func NewFilepathREST(
 	newFunc func() runtime.Object,
 	newListFunc func() runtime.Object) rest.Storage {
 
-	// ensures the root dir exists
-	ensureDir(rootpath)
-	// ensures the group dir exists
-	ensureDir(filepath.Join(rootpath, groupResource.Group))
-	// ensures the group-version dir exists
 	objRoot := filepath.Join(rootpath, groupResource.Group, groupResource.Resource)
-	ensureDir(objRoot)
+	if err := ensureDir(objRoot); err != nil {
+		panic(fmt.Sprintf("unable to write data dir: %s", err))
+	}
 
 	// file REST
 	rest := &filepathREST{
@@ -66,6 +64,7 @@ var _ rest.GracefulDeleter = &filepathREST{}
 var _ rest.CollectionDeleter = &filepathREST{}
 var _ rest.Getter = &filepathREST{}
 var _ rest.Lister = &filepathREST{}
+var _ rest.Scoper = &filepathREST{}
 
 func (f *filepathREST) New() runtime.Object {
 	return f.newFunc()
@@ -73,6 +72,10 @@ func (f *filepathREST) New() runtime.Object {
 
 func (f *filepathREST) NewList() runtime.Object {
 	return f.newListFunc()
+}
+
+func (f *filepathREST) NamespaceScoped() bool {
+	return f.isNamespaced
 }
 
 func (f *filepathREST) Get(
@@ -102,6 +105,10 @@ func (f *filepathREST) List(
 	return newListObj, nil
 }
 
+var (
+	ErrNamespaceNotExists = errors.New("namespace does not exist")
+)
+
 func (f *filepathREST) Create(
 	ctx context.Context,
 	obj runtime.Object,
@@ -117,8 +124,13 @@ func (f *filepathREST) Create(
 
 	if f.isNamespaced {
 		// ensures namespace dir
-		ns, _ := genericapirequest.NamespaceFrom(ctx)
-		ensureDir(filepath.Join(f.objRootPath, ns))
+		ns, ok := genericapirequest.NamespaceFrom(ctx)
+		if !ok {
+			return nil, ErrNamespaceNotExists
+		}
+		if err := ensureDir(filepath.Join(f.objRootPath, ns)); err != nil {
+			return nil, err
+		}
 	}
 
 	accessor, err := meta.Accessor(obj)
@@ -146,11 +158,6 @@ func (f *filepathREST) Update(
 	forceAllowCreate bool,
 	options *metav1.UpdateOptions,
 ) (runtime.Object, bool, error) {
-	if f.isNamespaced {
-		// ensures namespace dir
-		ns, _ := genericapirequest.NamespaceFrom(ctx)
-		ensureDir(filepath.Join(f.objRootPath, ns))
-	}
 
 	isCreate := false
 	oldObj, err := f.Get(ctx, name, nil)
@@ -159,6 +166,18 @@ func (f *filepathREST) Update(
 			return nil, false, err
 		}
 		isCreate = true
+	}
+
+	// TODO: should not be necessary, verify Get works before creating filepath
+	if f.isNamespaced {
+		// ensures namespace dir
+		ns, ok := genericapirequest.NamespaceFrom(ctx)
+		if !ok {
+			return nil, false, ErrNamespaceNotExists
+		}
+		if err := ensureDir(filepath.Join(f.objRootPath, ns)); err != nil {
+			return nil, false, err
+		}
 	}
 
 	updatedObj, err := objInfo.UpdatedObject(ctx, oldObj)
@@ -232,6 +251,7 @@ func (f *filepathREST) DeleteCollection(
 
 func (f *filepathREST) objectFileName(ctx context.Context, name string) string {
 	if f.isNamespaced {
+		// FIXME: return error if namespace is not found
 		ns, _ := genericapirequest.NamespaceFrom(ctx)
 		return filepath.Join(f.objRootPath, ns, name+".json")
 	}
@@ -240,6 +260,7 @@ func (f *filepathREST) objectFileName(ctx context.Context, name string) string {
 
 func (f *filepathREST) objectDirName(ctx context.Context) string {
 	if f.isNamespaced {
+		// FIXME: return error if namespace is not found
 		ns, _ := genericapirequest.NamespaceFrom(ctx)
 		return filepath.Join(f.objRootPath, ns)
 	}
@@ -272,10 +293,11 @@ func exists(filepath string) bool {
 	return err == nil
 }
 
-func ensureDir(dirname string) {
+func ensureDir(dirname string) error {
 	if !exists(dirname) {
-		os.Mkdir(dirname, 0700)
+		return os.MkdirAll(dirname, 0700)
 	}
+	return nil
 }
 
 func visitDir(dirname string, newFunc func() runtime.Object, codec runtime.Codec, visitFunc func(string, runtime.Object)) error {
